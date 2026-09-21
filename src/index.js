@@ -1,11 +1,12 @@
 const MAX_PLAYERS = 4;
-const INACTIVE_MS = 2 * 60 * 1000;
+const ROOM_TTL = 2 * 60 * 1000;
 
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400"
   };
 }
 
@@ -13,69 +14,100 @@ function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/json; charset=utf-8",
       ...corsHeaders()
     }
   });
+}
+
+function cleanRoom(room) {
+  if (!room) return null;
+
+  const now = Date.now();
+  const players = room.players || {};
+
+  for (const [peerId, player] of Object.entries(players)) {
+    if (now - (player.lastSeen || 0) > ROOM_TTL) {
+      delete players[peerId];
+    }
+  }
+
+  if (room.hostPeerId && !players[room.hostPeerId]) {
+    return null;
+  }
+
+  room.players = players;
+  return room;
 }
 
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
       return new Response(null, {
+        status: 204,
         headers: corsHeaders()
       });
     }
 
     const url = new URL(request.url);
-    const code = url.searchParams.get("code") || "";
+    const path = url.pathname.replace(/\/$/, "") || "/";
 
-    if (url.pathname === "/room" && request.method === "GET") {
-      if (!/^\d{3}$/.test(code)) {
-        return json({ error: "Invalid room code" }, 400);
-      }
-
-      const id = env.ROOMS.idFromName(code);
-
-      return env.ROOMS.get(id).fetch(
-        "https://room/room?code=" + code
-      );
+    if (path === "/" && request.method === "GET") {
+      return json({
+        ok: true,
+        service: "Street Racing Room Server"
+      });
     }
 
-    if (
-      ["/create", "/join", "/leave", "/heartbeat"].includes(url.pathname) &&
-      request.method === "POST"
-    ) {
-      let body;
+    const codeFromQuery = url.searchParams.get("code") || "";
+    const code = codeFromQuery.trim();
 
-      try {
-        body = await request.json();
-      } catch {
-        return json({ error: "Invalid JSON" }, 400);
+    if (
+      ["/create", "/room", "/join", "/leave", "/heartbeat"].includes(path)
+    ) {
+      if (path !== "/room" && !/^\d{3}$/.test(code)) {
+        return json(
+          { error: "Room code must be exactly 3 digits" },
+          400
+        );
       }
 
-      const roomCode = String(body.code || "");
-      const peerId = String(body.peerId || "");
+      let roomCode = code;
+      let body = {};
 
-      if (!/^\d{3}$/.test(roomCode) || !peerId) {
+      if (request.method === "POST") {
+        try {
+          body = await request.json();
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        if (!roomCode && typeof body.code === "string") {
+          roomCode = body.code.trim();
+        }
+      }
+
+      if (!/^\d{3}$/.test(roomCode)) {
         return json(
-          { error: "Invalid code or peerId" },
+          { error: "Room code must be exactly 3 digits" },
           400
         );
       }
 
       const id = env.ROOMS.idFromName(roomCode);
+      const stub = env.ROOMS.get(id);
 
-      return env.ROOMS.get(id).fetch(
-        "https://room" + url.pathname,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            code: roomCode,
-            peerId
-          })
-        }
+      const target = new URL(request.url);
+      target.pathname = path;
+      target.search =
+        `?code=${encodeURIComponent(roomCode)}`;
+
+      const forwarded = new Request(
+        target.toString(),
+        request
       );
+
+      return stub.fetch(forwarded);
     }
 
     return json({ error: "Not found" }, 404);
@@ -87,40 +119,71 @@ export class RoomServer {
     this.state = state;
   }
 
-  async fetch(request) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
+  async getRoom() {
     let room = await this.state.storage.get("room");
 
+    room = cleanRoom(room);
+
     if (!room) {
-      room = {
-        code: "",
-        hostPeerId: "",
-        players: {}
-      };
+      await this.state.storage.delete("room");
+      return null;
     }
 
-    const now = Date.now();
+    await this.state.storage.put("room", room);
 
-    for (const [peerId, player] of Object.entries(
-      room.players || {}
-    )) {
-      if (
-        now - (player.lastSeen || 0) >
-        INACTIVE_MS
-      ) {
-        delete room.players[peerId];
-      }
+    return room;
+  }
+
+  async saveRoom(room) {
+    await this.state.storage.put("room", room);
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/$/, "") || "/";
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders()
+      });
     }
+
+    const code = (
+      url.searchParams.get("code") || ""
+    ).trim();
+
+    if (!/^\d{3}$/.test(code)) {
+      return json(
+        { error: "Room code must be exactly 3 digits" },
+        400
+      );
+    }
+
+    let room = await this.getRoom();
 
     if (path === "/create" && request.method === "POST") {
-      const { code, peerId } = await request.json();
+      let data;
 
-      if (
-        room.hostPeerId &&
-        room.hostPeerId !== peerId
-      ) {
+      try {
+        data = await request.json();
+      } catch {
+        return json({ error: "Invalid JSON" }, 400);
+      }
+
+      const peerId =
+        typeof data.peerId === "string"
+          ? data.peerId.trim()
+          : "";
+
+      if (!peerId) {
+        return json(
+          { error: "peerId is required" },
+          400
+        );
+      }
+
+      if (room) {
         return json(
           { error: "Room already exists" },
           409
@@ -133,23 +196,23 @@ export class RoomServer {
         players: {
           [peerId]: {
             peerId,
-            lastSeen: now
+            lastSeen: Date.now()
           }
         }
       };
 
-      await this.state.storage.put("room", room);
+      await this.saveRoom(room);
 
       return json({
         ok: true,
-        code,
-        hostPeerId: peerId,
-        players: Object.keys(room.players)
+        code: room.code,
+        hostPeerId: room.hostPeerId,
+        players: Object.values(room.players)
       });
     }
 
     if (path === "/room" && request.method === "GET") {
-      if (!room.hostPeerId) {
+      if (!room) {
         return json(
           { error: "Room not found" },
           404
@@ -164,9 +227,27 @@ export class RoomServer {
     }
 
     if (path === "/join" && request.method === "POST") {
-      const { peerId } = await request.json();
+      let data;
 
-      if (!room.hostPeerId) {
+      try {
+        data = await request.json();
+      } catch {
+        return json({ error: "Invalid JSON" }, 400);
+      }
+
+      const peerId =
+        typeof data.peerId === "string"
+          ? data.peerId.trim()
+          : "";
+
+      if (!peerId) {
+        return json(
+          { error: "peerId is required" },
+          400
+        );
+      }
+
+      if (!room || !room.hostPeerId) {
         return json(
           { error: "Room not found" },
           404
@@ -174,4 +255,142 @@ export class RoomServer {
       }
 
       if (room.players[peerId]) {
-        room
+        room.players[peerId].lastSeen = Date.now();
+
+        await this.saveRoom(room);
+
+        return json({
+          ok: true,
+          code: room.code,
+          hostPeerId: room.hostPeerId,
+          players: Object.values(room.players)
+        });
+      }
+
+      const count =
+        Object.keys(room.players).length;
+
+      if (count >= MAX_PLAYERS) {
+        return json(
+          {
+            error: "Room is full",
+            maxPlayers: MAX_PLAYERS
+          },
+          409
+        );
+      }
+
+      room.players[peerId] = {
+        peerId,
+        lastSeen: Date.now()
+      };
+
+      await this.saveRoom(room);
+
+      return json({
+        ok: true,
+        code: room.code,
+        hostPeerId: room.hostPeerId,
+        players: Object.values(room.players)
+      });
+    }
+
+    if (
+      path === "/heartbeat" &&
+      request.method === "POST"
+    ) {
+      let data;
+
+      try {
+        data = await request.json();
+      } catch {
+        return json(
+          { error: "Invalid JSON" },
+          400
+        );
+      }
+
+      const peerId =
+        typeof data.peerId === "string"
+          ? data.peerId.trim()
+          : "";
+
+      if (!peerId) {
+        return json(
+          { error: "peerId is required" },
+          400
+        );
+      }
+
+      if (!room || !room.players[peerId]) {
+        return json(
+          { error: "Player not found" },
+          404
+        );
+      }
+
+      room.players[peerId].lastSeen = Date.now();
+
+      await this.saveRoom(room);
+
+      return json({ ok: true });
+    }
+
+    if (
+      path === "/leave" &&
+      request.method === "POST"
+    ) {
+      let data;
+
+      try {
+        data = await request.json();
+      } catch {
+        return json(
+          { error: "Invalid JSON" },
+          400
+        );
+      }
+
+      const peerId =
+        typeof data.peerId === "string"
+          ? data.peerId.trim()
+          : "";
+
+      if (!peerId) {
+        return json(
+          { error: "peerId is required" },
+          400
+        );
+      }
+
+      if (!room) {
+        return json({ ok: true });
+      }
+
+      if (peerId === room.hostPeerId) {
+        await this.state.storage.delete("room");
+
+        return json({
+          ok: true,
+          roomClosed: true
+        });
+      }
+
+      if (room.players[peerId]) {
+        delete room.players[peerId];
+
+        await this.saveRoom(room);
+      }
+
+      return json({
+        ok: true,
+        players: Object.values(room.players)
+      });
+    }
+
+    return json(
+      { error: "Not found" },
+      404
+    );
+  }
+          }
