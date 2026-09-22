@@ -59,58 +59,35 @@ export default {
       });
     }
 
-    const codeFromQuery = url.searchParams.get("code") || "";
-    const code = codeFromQuery.trim();
+    const allowedPaths = [
+      "/create",
+      "/room",
+      "/join",
+      "/leave",
+      "/heartbeat"
+    ];
 
-    if (
-      ["/create", "/room", "/join", "/leave", "/heartbeat"].includes(path)
-    ) {
-      if (path !== "/room" && !/^\d{3}$/.test(code)) {
-        return json(
-          { error: "Room code must be exactly 3 digits" },
-          400
-        );
-      }
-
-      let roomCode = code;
-      let body = {};
-
-      if (request.method === "POST") {
-        try {
-          body = await request.json();
-        } catch {
-          return json({ error: "Invalid JSON" }, 400);
-        }
-
-        if (!roomCode && typeof body.code === "string") {
-          roomCode = body.code.trim();
-        }
-      }
-
-      if (!/^\d{3}$/.test(roomCode)) {
-        return json(
-          { error: "Room code must be exactly 3 digits" },
-          400
-        );
-      }
-
-      const id = env.ROOMS.idFromName(roomCode);
-      const stub = env.ROOMS.get(id);
-
-      const target = new URL(request.url);
-      target.pathname = path;
-      target.search =
-        `?code=${encodeURIComponent(roomCode)}`;
-
-      const forwarded = new Request(
-        target.toString(),
-        request
-      );
-
-      return stub.fetch(forwarded);
+    if (!allowedPaths.includes(path)) {
+      return json({ error: "Not found" }, 404);
     }
 
-    return json({ error: "Not found" }, 404);
+    const code = (url.searchParams.get("code") || "").trim();
+
+    if (!/^\d{3}$/.test(code)) {
+      return json(
+        { error: "Room code must be exactly 3 digits" },
+        400
+      );
+    }
+
+    const id = env.ROOMS.idFromName(code);
+    const stub = env.ROOMS.get(id);
+
+    const target = new URL(request.url);
+    target.pathname = path;
+    target.search = `?code=${encodeURIComponent(code)}`;
+
+    return stub.fetch(new Request(target.toString(), request));
   }
 };
 
@@ -130,7 +107,6 @@ export class RoomServer {
     }
 
     await this.state.storage.put("room", room);
-
     return room;
   }
 
@@ -141,6 +117,7 @@ export class RoomServer {
   async fetch(request) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/$/, "") || "/";
+    const code = (url.searchParams.get("code") || "").trim();
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
@@ -148,10 +125,6 @@ export class RoomServer {
         headers: corsHeaders()
       });
     }
-
-    const code = (
-      url.searchParams.get("code") || ""
-    ).trim();
 
     if (!/^\d{3}$/.test(code)) {
       return json(
@@ -177,10 +150,7 @@ export class RoomServer {
           : "";
 
       if (!peerId) {
-        return json(
-          { error: "peerId is required" },
-          400
-        );
+        return json({ error: "peerId is required" }, 400);
       }
 
       if (room) {
@@ -241,10 +211,7 @@ export class RoomServer {
           : "";
 
       if (!peerId) {
-        return json(
-          { error: "peerId is required" },
-          400
-        );
+        return json({ error: "peerId is required" }, 400);
       }
 
       if (!room || !room.hostPeerId) {
@@ -256,7 +223,6 @@ export class RoomServer {
 
       if (room.players[peerId]) {
         room.players[peerId].lastSeen = Date.now();
-
         await this.saveRoom(room);
 
         return json({
@@ -267,8 +233,7 @@ export class RoomServer {
         });
       }
 
-      const count =
-        Object.keys(room.players).length;
+      const count = Object.keys(room.players).length;
 
       if (count >= MAX_PLAYERS) {
         return json(
@@ -295,19 +260,13 @@ export class RoomServer {
       });
     }
 
-    if (
-      path === "/heartbeat" &&
-      request.method === "POST"
-    ) {
+    if (path === "/heartbeat" && request.method === "POST") {
       let data;
 
       try {
         data = await request.json();
       } catch {
-        return json(
-          { error: "Invalid JSON" },
-          400
-        );
+        return json({ error: "Invalid JSON" }, 400);
       }
 
       const peerId =
@@ -316,10 +275,7 @@ export class RoomServer {
           : "";
 
       if (!peerId) {
-        return json(
-          { error: "peerId is required" },
-          400
-        );
+        return json({ error: "peerId is required" }, 400);
       }
 
       if (!room || !room.players[peerId]) {
@@ -330,25 +286,18 @@ export class RoomServer {
       }
 
       room.players[peerId].lastSeen = Date.now();
-
       await this.saveRoom(room);
 
       return json({ ok: true });
     }
 
-    if (
-      path === "/leave" &&
-      request.method === "POST"
-    ) {
+    if (path === "/leave" && request.method === "POST") {
       let data;
 
       try {
         data = await request.json();
       } catch {
-        return json(
-          { error: "Invalid JSON" },
-          400
-        );
+        return json({ error: "Invalid JSON" }, 400);
       }
 
       const peerId =
@@ -357,10 +306,7 @@ export class RoomServer {
           : "";
 
       if (!peerId) {
-        return json(
-          { error: "peerId is required" },
-          400
-        );
+        return json({ error: "peerId is required" }, 400);
       }
 
       if (!room) {
@@ -378,7 +324,6 @@ export class RoomServer {
 
       if (room.players[peerId]) {
         delete room.players[peerId];
-
         await this.saveRoom(room);
       }
 
@@ -388,9 +333,6 @@ export class RoomServer {
       });
     }
 
-    return json(
-      { error: "Not found" },
-      404
-    );
+    return json({ error: "Not found" }, 404);
   }
-          }
+}
